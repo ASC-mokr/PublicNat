@@ -115,6 +115,73 @@ cd /opt/publicnat/src && git pull --ff-only
 | `fatal: could not read Username` | origin по HTTPS, а кредов нет — настройте Вариант B или переключите remote на SSH |
 | `404 / Not Found` для существующего репо | У deploy-ключа нет доступа к этому репозиторию (Deploy keys привязаны к одному репо) |
 | Токен протух (fine-grained имеет срок) | Замените значение в `/root/.git-credentials` |
+| `GitHub API error: Validation Failed` | Это НЕ ошибка git — так отвечает UI GitHub при сохранении ключа/токена. См. раздел ниже |
+
+## Ошибка «GitHub API error: Validation Failed» при добавлении ключа/токена
+
+`Validation Failed` означает, что GitHub отклонил **форму** (неправильный
+формат ключа, дубликат, неверные поля токена), а не доступ к репозиторию.
+Частые причины и решения:
+
+### 1. Deploy key уже используется другим репозиторием (самая частая)
+Один и тот же публичный ключ GitHub разрешено привязать **только к одному
+репозиторию** как Deploy key. Если этим же ключом вы уже добавляли доступ
+к другому репо — будет `Validation Failed`.
+
+Решения (выберите одно):
+- Сгенерируйте на VPS **новый** ключ под этот репозиторий:
+  ```bash
+  ssh-keygen -t ed25519 -C "publicnat-deploy" -f /root/.ssh/github_deploy_key -N ""
+  cat /root/.ssh/github_deploy_key.pub   # этот содержимое вставляйте в Deploy keys
+  ```
+  и укажите git использовать именно его:
+  ```bash
+  cat >> /root/.ssh/config <<'EOF'
+  Host github.com
+      IdentityFile /root/.ssh/github_deploy_key
+      IdentitiesOnly yes
+  EOF
+  chmod 600 /root/.ssh/config
+  ```
+- Либо удалите ключ из старого репозитория (Settings → Deploy keys).
+- Либо добавьте ключ не как Deploy key, а в аккаунт:
+  **Settings → SSH and GPG keys** — там дубликаты между репо не мешают
+  (но это шире права: ключ даст доступ ко всем вашим репозиториям).
+
+### 2. Ключ вставлен с обрезанным/лишним символом
+В поле Key должен быть **весь одной строкой**, начиная с `ssh-ed25519 ...`
+(или `ssh-rsa ...`) и заканчивая комментарием. Проверьте:
+```bash
+ssh-keygen -l -f /root/.ssh/id_ed25519.pub   # должен показать fingerprint без ошибок
+```
+Если `ssh-keygen` ругается — файл битый, перегенерируйте. Не вставляйте
+заголовки `----BEGIN PUBLIC KEY----` (это формат PEM, GitHub его не принимает).
+
+### 3. Дубликат ключа в этом же месте
+Такой же ключ уже добавлен в этот репозиторий/аккаунт — GitHub вернёт
+`Validation Failed`. Проверьте список существующих ключей и удалите старый.
+
+### 4. Fine-grained PAT: неправильная форма создания
+- **Repository access** → выбрать *Only select repositories* → PublicNat
+  (если выбрано «All repositories», fine-grained токен для private-репо может
+  требовать одобрения OAuth-приложения — проще выбрать конкретный репозиторий).
+- **Permissions** → *Repository permissions* → **Contents: Read-only**
+  (этого достаточно для деплоя; Contents — это ровно то разрешение, из-за
+  которого чаще всего «валидация» падает, если оставить No permissions).
+- Имя токена без спецсимволов, срок действия не пустой.
+
+### 5. Быстрая проверка, что доступ реально работает
+После успешного добавления на VPS:
+```bash
+ssh -T git@github.com
+# Hi ASC-mokr/PublicNat! ... — для deploy-ключа
+git ls-remote git@github.com:ASC-mokr/PublicNat.git HEAD   # должен вернуть SHA
+```
+Для HTTPS+PAT:
+```bash
+curl -sI -H "Authorization: Bearer <ПАТ>" \
+  https://api.github.com/repos/ASC-mokr/PublicNat | head -1   # 200 = ок
+```
 
 ## Безопасность
 
