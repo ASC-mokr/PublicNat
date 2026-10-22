@@ -61,7 +61,15 @@ fi
 
 # ---------- 4. Конфигурация приложения ----------
 log "Проверка env.sh и создание systemd-пользователя"
-grep -q CHANGE_ME "$ENV_FILE" && die "В $ENV_FILE остались значения CHANGE_ME"
+if grep -n CHANGE_ME "$ENV_FILE" >/dev/null; then
+    echo "Незаменённые значения CHANGE_ME найдены в строках:" >&2
+    grep -n CHANGE_ME "$ENV_FILE" | sed 's/^/    /' >&2
+    die "Замените все значения CHANGE_ME в $ENV_FILE (ВАЖНО: пароль в DATABASE_URL должен совпадать с PG_PASSWORD)"
+fi
+for var in PG_DB PG_USER PG_PASSWORD DATABASE_URL JWT_SECRET RATHOLE_CONFIG_PATH PORT_RANGE_START PORT_RANGE_END; do
+    [[ -n $(grep -E "^${var}=" "$ENV_FILE" | tail -1 | cut -d= -f2-) ]] \
+        || die "Переменная ${var} не задана или пуста в $ENV_FILE"
+done
 chmod 600 "$ENV_FILE"
 id publicnat &>/dev/null || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin publicnat
 
