@@ -3,11 +3,15 @@
 # PublicNat — деплой Control Plane + RatHole server на Debian 12 (VPS)
 # Репозиторий: https://github.com/ASC-mokr/PublicNat
 #
-# Запускать как root на чистом VPS с Debian 12:
-#   git clone https://github.com/ASC-mokr/PublicNat.git /opt/publicnat/src
-#   cd /opt/publicnat/src/deploy && ./deploy.sh
+# Запускать как root на чистом VPS с Debian 12 (репозиторий ПРИВАТНЫЙ —
+# настройте доступ заранее, см. deploy/PRIVATE_REPO.md):
+#   git clone git@github.com:ASC-mokr/PublicNat.git /opt/publicnat/src
+#   cd /opt/publicnat/src/deploy && sudo bash deploy.sh
 #
 # Идемпотентен: повторный запуск = git pull + пересборка + рестарт сервисов.
+# Для приватного репозитория git-доступ берётся из окружения:
+#   - SSH-ключ пользователя root (если origin клонирован по git@github.com:...)
+#   - GIT_CONFIG_GLOBAL=/root/.gitconfig (если настроены insteadOf + PAT-креды)
 # ============================================================
 set -euo pipefail
 
@@ -15,6 +19,8 @@ APP_DIR=/opt/publicnat
 SRC_DIR=$APP_DIR/src
 BIN_DIR=$APP_DIR/bin
 ENV_FILE=$APP_DIR/env.sh
+GIT_URL=${GIT_URL:-https://github.com/ASC-mokr/PublicNat.git}
+export GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-/root/.gitconfig}
 GO_VERSION=1.23.4
 RATHOLE_FALLBACK_VERSION=v0.5.9
 
@@ -42,12 +48,17 @@ fi
 export PATH=/usr/local/go/bin:$PATH
 export GOFLAGS=-buildvcs=false
 
-# ---------- 3. Исходники ----------
+# ---------- 3. Исходники (приватный репозиторий) ----------
 log "Синхронизация исходников ASC-mokr/PublicNat в $SRC_DIR"
 mkdir -p "$APP_DIR"
 if [[ -d $SRC_DIR/.git ]]; then
-    # Рабочая копия уже клонирована — обновляем до последней версии из GitHub
-    git -C "$SRC_DIR" fetch --all -q
+    # Рабочая копия уже клонирована — обновляем до последней версии из GitHub.
+    # fetch использует origin и креды из окружения (SSH-ключ root или
+    # GIT_CONFIG_GLOBAL=/root/.gitconfig с insteadOf/PAT).
+    if ! git -C "$SRC_DIR" fetch --all -q; then
+        die "git fetch не выполнен. Приватный репозиторий: проверьте доступ (deploy/PRIVATE_REPO.md).
+    Для SSH: ssh -T git@github.com; для HTTPS: cat /root/.gitconfig и /root/.git-credentials"
+    fi
     BRANCH=$(git -C "$SRC_DIR" rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null | cut -d/ -f2 || echo main)
     git -C "$SRC_DIR" reset --hard -q "origin/${BRANCH:-main}"
 elif [[ $(cd "$(dirname "$0")/.." && pwd) == $SRC_DIR ]]; then
@@ -55,7 +66,8 @@ elif [[ $(cd "$(dirname "$0")/.." && pwd) == $SRC_DIR ]]; then
 elif [[ -d $SRC_DIR ]]; then
     die "$SRC_DIR существует, но не является git-репозиторием"
 else
-    git clone -q https://github.com/ASC-mokr/PublicNat.git "$SRC_DIR"
+    git clone -q "$GIT_URL" "$SRC_DIR" \
+        || die "git clone не выполнен. Приватный репозиторий: сначала настройте доступ — см. deploy/PRIVATE_REPO.md"
 fi
 [[ -d $SRC_DIR/backend ]] || die "В репозитории нет каталога backend/"
 
