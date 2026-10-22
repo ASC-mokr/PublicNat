@@ -93,19 +93,28 @@ source "$ENV_FILE"
 log "Настройка PostgreSQL (роль ${PG_USER:-publicnat}, БД ${PG_DB:-publicnat})"
 systemctl enable --now postgresql
 
-psql_admin() { su - postgres -c "psql -v ON_ERROR_STOP=1 -qc \"$1\""; }
-
-if ! psql_admin "\
-    DO \$\$ BEGIN
-      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${PG_USER:-publicnat}') THEN
-        CREATE ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD not set}")';
-      ELSE
-        ALTER ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD not set}")';
-      END IF;
-    END \$\$;"; then
+# SQL передаём через файл и psql -f: так надёжнее, чем экранирование кавычек
+# внутри su -c (ошибка вида «DO 3420781 BEGIN» — это PID шелла, подставленный
+# вместо $$ из-за двойного раскрытия переменных).
+PGSQL_TMP=$(mktemp /tmp/publicnat-pg.XXXXXX.sql)
+trap 'rm -f "$PGSQL_TMP"' EXIT
+cat > "$PGSQL_TMP" <<EOF
+DO \$body\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${PG_USER:-publicnat}') THEN
+    CREATE ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD не задан в env.sh}")';
+  ELSE
+    ALTER ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD не задан в env.sh}")';
+  END IF;
+END
+\$body\$
+EOF
+chmod 644 "$PGSQL_TMP"
+if ! su - postgres -c "psql -v ON_ERROR_STOP=1 -q -f '$PGSQL_TMP'"; then
     die "Не удалось создать/обновить роль PostgreSQL"
 fi
-su - postgres -c "createdb -O ${PG_USER:-publicnat} ${PG_DB:-publicnat}" 2>/dev/null || true
+su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${PG_DB:-publicnat}'\"" | grep -q 1 \
+    || su - postgres -c "createdb -O ${PG_USER:-publicnat} ${PG_DB:-publicnat}" \
+    || die "Не удалось создать базу данных ${PG_DB:-publicnat}"
 
 pg_hba_has_app() { grep -qE '^host\s+'"${PG_DB:-publicnat}"'\s+'"${PG_USER:-publicnat}"'\s+127\.0\.0\.1/32' /etc/postgresql/*/main/pg_hba.conf; }
 if ! pg_hba_has_app; then
