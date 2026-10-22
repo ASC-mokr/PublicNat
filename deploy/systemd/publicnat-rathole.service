@@ -1,0 +1,22 @@
+[Unit]
+Description=PublicNat - RatHole L4 tunnel server
+Documentation=https://github.com/rathole-org/rathole
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rathole-run
+Restart=on-failure
+RestartSec=3
+# RatHole слушает привилегированные порты не нужны (2333, 5000-6000) — запускаем от root,
+# но с максимальным sandbox-ом:
+User=root
+PIDFile=/run/rathole.pid
+LimitNOFILE=1048576
+# SIGHUP перегружает конфиг (его отправляет control-plane после атомарной записи server.toml)
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

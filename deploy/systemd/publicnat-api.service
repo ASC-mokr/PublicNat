@@ -1,0 +1,26 @@
+[Unit]
+Description=PublicNat - Control Plane REST API (RatHole config sync)
+Documentation=https://github.com/ASC-mokr/PublicNat
+After=network-online.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=publicnat
+Group=publicnat
+WorkingDirectory=/opt/publicnat/src/backend
+EnvironmentFile=/opt/publicnat/env.sh
+Environment=ENV_FILE=/opt/publicnat/env.sh
+Environment=MIGRATIONS_DIR=/opt/publicnat/src/backend/migrations
+ExecStart=/opt/publicnat/bin/control-plane
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/rathole
+
+[Install]
+WantedBy=multi-user.target

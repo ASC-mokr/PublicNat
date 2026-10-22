@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ============================================================
+# PublicNat — деплой Control Plane + RatHole server на Debian 12 (VPS)
+# Репозиторий: https://github.com/ASC-mokr/PublicNat
+#
+# Запускать как root на чистом VPS с Debian 12:
+#   git clone https://github.com/ASC-mokr/PublicNat.git /opt/publicnat/src
+#   cd /opt/publicnat/src/deploy && ./deploy.sh
+#
+# Идемпотентен: повторный запуск = git pull + пересборка + рестарт сервисов.
+# ============================================================
+set -euo pipefail
+
+APP_DIR=/opt/publicnat
+SRC_DIR=$APP_DIR/src
+BIN_DIR=$APP_DIR/bin
+ENV_FILE=$APP_DIR/env.sh
+GO_VERSION=1.23.4
+RATHOLE_FALLBACK_VERSION=v0.5.9
+
+log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
+die()  { echo -e "\033[1;31mERROR: $*\033[0m" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "Запускайте скрипт от root (sudo ./deploy.sh)"
+[[ -f $ENV_FILE ]] || die "Не найден $ENV_FILE — скопируйте deploy/env.sh.example и заполните секреты"
+
+# ---------- 1. Системные пакеты ----------
+log "Установка системных пакетов (git, postgresql, curl, ufw)"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq git curl ca-certificates gnupg postgresql postgresql-contrib ufw >/dev/null
+
+# ---------- 2. Go (если отсутствует нужной версии) ----------
+if [[ ! -x /usr/local/go/bin/go ]] || ! /usr/local/go/bin/go version | grep -q "go1\.\(2[3-9]\|[3-9][0-9]\)"; then
+    log "Установка Go ${GO_VERSION}"
+    curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+else
+    log "Go уже установлен: $(/usr/local/go/bin/go version)"
+fi
+export PATH=/usr/local/go/bin:$PATH
+export GOFLAGS=-buildvcs=false
+
+# ---------- 3. Исходники ----------
+log "Синхронизация исходников ASC-mokr/PublicNat в $SRC_DIR"
+mkdir -p "$APP_DIR"
+if [[ -d $SRC_DIR/.git ]]; then
+    # Рабочая копия уже клонирована — обновляем до последней версии из GitHub
+    git -C "$SRC_DIR" fetch --all -q
+    BRANCH=$(git -C "$SRC_DIR" rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null | cut -d/ -f2 || echo main)
+    git -C "$SRC_DIR" reset --hard -q "origin/${BRANCH:-main}"
+elif [[ $(cd "$(dirname "$0")/.." && pwd) == $SRC_DIR ]]; then
+    : # deploy.sh запущен прямо из целевой рабочей копии (git clone ... /opt/publicnat/src) — ничего не делаем
+elif [[ -d $SRC_DIR ]]; then
+    die "$SRC_DIR существует, но не является git-репозиторием"
+else
+    git clone -q https://github.com/ASC-mokr/PublicNat.git "$SRC_DIR"
+fi
+[[ -d $SRC_DIR/backend ]] || die "В репозитории нет каталога backend/"
+
+# ---------- 4. Конфигурация приложения ----------
+log "Проверка env.sh и создание systemd-пользователя"
+grep -q CHANGE_ME "$ENV_FILE" && die "В $ENV_FILE остались значения CHANGE_ME"
+chmod 600 "$ENV_FILE"
+id publicnat &>/dev/null || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin publicnat
+
+# source env.sh для переменных деплоя (DATABASE_URL, порты и т.д.)
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+# ---------- 5. PostgreSQL: роль + база + миграции ----------
+log "Настройка PostgreSQL (роль ${PG_USER:-publicnat}, БД ${PG_DB:-publicnat})"
+systemctl enable --now postgresql
+
+psql_admin() { su - postgres -c "psql -v ON_ERROR_STOP=1 -qc \"$1\""; }
+
+if ! psql_admin "\
+    DO \$\$ BEGIN
+      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${PG_USER:-publicnat}') THEN
+        CREATE ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD not set}")';
+      ELSE
+        ALTER ROLE ${PG_USER:-publicnat} LOGIN PASSWORD '$(sed "s/'/''/g" <<<"${PG_PASSWORD:?PG_PASSWORD not set}")';
+      END IF;
+    END \$\$;"; then
+    die "Не удалось создать/обновить роль PostgreSQL"
+fi
+su - postgres -c "createdb -O ${PG_USER:-publicnat} ${PG_DB:-publicnat}" 2>/dev/null || true
+
+pg_hba_has_app() { grep -qE '^host\s+'"${PG_DB:-publicnat}"'\s+'"${PG_USER:-publicnat}"'\s+127\.0\.0\.1/32' /etc/postgresql/*/main/pg_hba.conf; }
+if ! pg_hba_has_app; then
+    HBA=$(ls /etc/postgresql/*/main/pg_hba.conf | sort -V | tail -1)
+    printf 'host\t%s\t%s\t127.0.0.1/32\tscram-sha-256\nhost\t%s\t%s\t::1/128\tscram-sha-256\n' \
+        "${PG_DB:-publicnat}" "${PG_USER:-publicnat}" "${PG_DB:-publicnat}" "${PG_USER:-publicnat}" >> "$HBA"
+    log "Добавлены записи scram-sha-256 в $HBA"
+fi
+systemctl reload postgresql
+
+# Миграции применяются и самим бэкэндом при старте — здесь только проверка соединения:
+DB_HOST=$(sed -E 's|.*@([^:/]+).*|\1|' <<<"$DATABASE_URL")
+DB_PORT=$(sed -E 's|.*@[^:/]+:([0-9]+).*|\1|' <<<"$DATABASE_URL")
+PGPASSWORD=$PG_PASSWORD psql -h "$DB_HOST" -p "${DB_PORT:-5432}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1" >/dev/null \
+    || die "Не удалось подключиться к PostgreSQL через DATABASE_URL"
+log "PostgreSQL доступен. SQL-миграции применит бэкэнд при старте (backend/migrations/)"
+
+# ---------- 6. Сборка Go-бэкэнда ----------
+log "Сборка control-plane (go build)"
+cd "$SRC_DIR/backend"
+install -d -m 755 "$BIN_DIR"
+go mod download
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BIN_DIR/control-plane.new" ./cmd/server
+mv -f "$BIN_DIR/control-plane.new" "$BIN_DIR/control-plane"
+chmod 755 "$BIN_DIR/control-plane"
+
+# ---------- 7. RatHole server ----------
+log "Установка бинарника rathole (${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION})"
+RATHOLE_BIN=$BIN_DIR/rathole
+ASSET="rathole-${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION}-x86_64-unknown-linux-gnu"
+curl -fsSL -o /tmp/rathole.tar.gz \
+    "https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION}/${ASSET}.tar.gz" \
+    || die "Не удалось скачать rathole. Проверьте RATHOLE_VERSION в env.sh (список релизов: https://github.com/rathole-org/rathole/releases)"
+tar -xzf /tmp/rathole.tar.gz -C /tmp
+install -m 755 "/tmp/${ASSET}/rathole" "$RATHOLE_BIN" 2>/dev/null || install -m 755 /tmp/rathole "$RATHOLE_BIN"
+rm -rf /tmp/rathole.tar.gz "/tmp/${ASSET}" /tmp/rathole
+
+install -d -m 755 /etc/rathole
+cp -f "$SRC_DIR/deploy/rathole/bootstrap-server.toml" /etc/rathole/server.toml
+# RatHole не умеет писать pid-file — wrapper пишет PID сам, чтобы бэкэнд
+# мог слать SIGHUP через RATHOLE_PIDFILE (см. internal/rathole/sync.go).
+cat > /usr/local/bin/rathole-run <<EOF
+#!/bin/bash
+echo \$\$ > /run/rathole.pid
+exec $RATHOLE_BIN /etc/rathole/server.toml
+EOF
+chmod 755 /usr/local/bin/rathole-run
+
+chown -R publicnat:publicnat "$APP_DIR"
+chown root:root /etc/rathole /etc/rathole/server.toml
+
+# ---------- 8. systemd-юниты ----------
+log "Установка systemd-юнитов"
+install -m 644 "$SRC_DIR/deploy/systemd/publicnat-api.service"  /etc/systemd/system/
+install -m 644 "$SRC_DIR/deploy/systemd/publicnat-rathole.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable publicnat-rathole publicnat-api
+
+# ---------- 9. Firewall ----------
+log "Настройка UFW (SSH, API 8080, RatHole 2333, туннели ${PORT_RANGE_START:-5000}-${PORT_RANGE_END:-6000})"
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
+ufw allow 22/tcp comment 'SSH' >/dev/null
+ufw allow 8080/tcp comment 'PublicNat API' >/dev/null
+ufw allow 2333/tcp comment 'RatHole client control' >/dev/null
+ufw allow "${PORT_RANGE_START:-5000}:${PORT_RANGE_END:-6000}/tcp" comment 'PublicNat tunnels tcp' >/dev/null
+ufw allow "${PORT_RANGE_START:-5000}:${PORT_RANGE_END:-6000}/udp" comment 'PublicNat tunnels udp' >/dev/null
+ufw --force enable >/dev/null
+
+# ---------- 10. Старт ----------
+log "Запуск сервисов"
+systemctl restart publicnat-rathole
+sleep 1
+systemctl restart publicnat-api
+sleep 2
+systemctl --no-pager status publicnat-rathole publicnat-api | grep -E "●|Active:" || true
+
+log "Проверка API"
+if curl -fsS -X POST http://localhost:8080/api/auth/register -H 'Content-Type: application/json' \
+     -d '{"email":"healthcheck@local","password":"HealthCheck1!"}' >/dev/null 2>&1 \
+   || curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+    echo "API отвечает."
+else
+    echo "ВНИМАНИЕ: API не ответил — смотрите journalctl -u publicnat-api -n 50"
+fi
+
+echo
+echo -e "\033[1;32mДеплой завершён.\033[0m"
+echo "  API:          http://$(hostname -I | awk '{print $1}'):8080"
+echo "  RatHole:      $(hostname -I | awk '{print $1}'):${RATHOLE_BIND_ADDR##*:}"
+echo "  Логи:         journalctl -u publicnat-api -f   |   journalctl -u publicnat-rathole -f"
+echo "  Конфиг:       /etc/rathole/server.toml (генерируется бэкэндом, НЕ редактировать вручную)"
+echo "  Обновление:   cd $SRC_DIR && git pull && $SRC_DIR/deploy/deploy.sh"

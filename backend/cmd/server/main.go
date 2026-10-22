@@ -41,6 +41,7 @@ func main() {
 		BindAddr:   cfg.RatholeBindAddr,
 		Container:  cfg.RatholeContainer,
 		PID:        cfg.RatholePID,
+		PIDFile:    cfg.RatholePIDFile,
 		Logger:     logger,
 	})
 

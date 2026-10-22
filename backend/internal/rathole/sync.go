@@ -40,6 +40,7 @@ type Syncer struct {
 	bindAddr    string // глобальный [server] bind_addr (порт клиентов RatHole)
 	container   string // имя docker-контейнера RatHole
 	pid         int    // если > 0 — слать сигнал напрямую процессу, минуя Docker
+	pidFile     string // если задан — PID перечитывается из файла перед каждой отправкой сигнала
 	dockerBin   string // путь к бинарнику docker (по умолчанию "docker")
 	sighupRetry int    // повторы при временных ошибках docker CLI
 }
@@ -50,6 +51,7 @@ type Options struct {
 	BindAddr    string
 	Container   string
 	PID         int
+	PIDFile     string
 	DockerBin   string
 	Logger      *slog.Logger
 	SighupRetry int
@@ -76,6 +78,7 @@ func NewSyncer(gen Generator, opts Options) *Syncer {
 		bindAddr:    opts.BindAddr,
 		container:   opts.Container,
 		pid:         opts.PID,
+		pidFile:     opts.PIDFile,
 		dockerBin:   dockerBin,
 		sighupRetry: retry,
 	}
@@ -164,19 +167,27 @@ func (s *Syncer) atomicWrite(content string) error {
 }
 
 // sendSIGHUP отправляет сигнал перезагрузки:
-//   - через syscall.Kill, если задан RATHOLE_PID (общая машина с RatHole);
+//   - через syscall.Kill, если задан RATHOLE_PID или RATHOLE_PIDFILE (RatHole на той же машине);
 //   - иначе через `docker kill -s SIGHUP <container>` (RatHole в контейнере).
 func (s *Syncer) sendSIGHUP(ctx context.Context) error {
-	if s.pid > 0 {
-		if err := syscall.Kill(s.pid, syscall.SIGHUP); err != nil {
-			return fmt.Errorf("rathole: kill -SIGHUP pid=%d: %w", s.pid, err)
+	pid := s.pid
+	if pid <= 0 && s.pidFile != "" {
+		p, err := readPIDFile(s.pidFile)
+		if err != nil {
+			return fmt.Errorf("rathole: read pidfile %s: %w", s.pidFile, err)
 		}
-		s.logger.Info("SIGHUP sent to process", "pid", s.pid)
+		pid = p
+	}
+	if pid > 0 {
+		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+			return fmt.Errorf("rathole: kill -SIGHUP pid=%d: %w", pid, err)
+		}
+		s.logger.Info("SIGHUP sent to process", "pid", pid, "pidfile", s.pidFile)
 		return nil
 	}
 
 	if s.container == "" {
-		return fmt.Errorf("rathole: neither RATHOLE_PID nor RATHOLE_CONTAINER is configured")
+		return fmt.Errorf("rathole: neither RATHOLE_PID/RATHOLE_PIDFILE nor RATHOLE_CONTAINER is configured")
 	}
 
 	var lastErr error
@@ -252,7 +263,7 @@ func RenderServerConfig(bindAddr string, tunnels []storage.Tunnel) (string, erro
 		}
 		fmt.Fprintf(&b, "[server.services.%s]\n", key)
 		fmt.Fprintf(&b, "type = %q\n", typ)
-		fmt.Fprintf(&b, "token = %q\n", escapeTOMLString(t.TunnelToken))
+		fmt.Fprintf(&b, "token = \"%s\"\n", escapeTOMLString(t.TunnelToken))
 		fmt.Fprintf(&b, "bind_addr = \"0.0.0.0:%d\"\n\n", t.ServerPort)
 	}
 	return b.String(), nil
@@ -289,4 +300,17 @@ func GenerateToken(length int) (string, error) {
 	}
 	tok := base64.RawURLEncoding.EncodeToString(buf)[:length]
 	return tok, nil
+}
+
+// readPIDFile читает и парсит PID из файла (fmt.Sprintf("%d\n", pid) в rathole-wrapper).
+func readPIDFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid pid in %q", path)
+	}
+	return pid, nil
 }
