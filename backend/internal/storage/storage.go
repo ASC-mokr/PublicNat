@@ -195,7 +195,13 @@ func (s *Store) ListAllTunnels(ctx context.Context) ([]Tunnel, error) {
 // DeleteTunnel удаляет туннель по id и пользователю (защита от чужих объектов).
 // Возвращает ErrNotFound, если ничего не удалено.
 func (s *Store) DeleteTunnel(ctx context.Context, id, userID string) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM tunnels WHERE id = $1 AND user_id = $2`, id, userID)
+	// id — UUID туннеля; допускаем и имя туннеля в рамках пользователя
+	// (CLI оперирует именами): DELETE с составным условием через подзапрос.
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM tunnels t
+		WHERE t.user_id = $2::uuid
+		  AND (t.id::text = $1 OR t.name = $1)`,
+		id, userID)
 	if err != nil {
 		return fmt.Errorf("storage: delete tunnel: %w", err)
 	}
