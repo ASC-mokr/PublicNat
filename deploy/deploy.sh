@@ -22,7 +22,7 @@ ENV_FILE=$APP_DIR/env.sh
 GIT_URL=${GIT_URL:-https://github.com/ASC-mokr/PublicNat.git}
 export GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-/root/.gitconfig}
 GO_VERSION=1.23.4
-RATHOLE_FALLBACK_VERSION=v0.5.9
+RATHOLE_FALLBACK_VERSION=v0.5.0 # последняя стабильная; активы v0.5.0: rathole-<target>.zip, имя БЕЗ версии
 
 log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
 die()  { echo -e "\033[1;31mERROR: $*\033[0m" >&2; exit 1; }
@@ -142,15 +142,28 @@ mv -f "$BIN_DIR/control-plane.new" "$BIN_DIR/control-plane"
 chmod 755 "$BIN_DIR/control-plane"
 
 # ---------- 7. RatHole server ----------
-log "Установка бинарника rathole (${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION})"
+RV=${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION}
 RATHOLE_BIN=$BIN_DIR/rathole
-ASSET="rathole-${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION}-x86_64-unknown-linux-gnu"
-curl -fsSL -o /tmp/rathole.tar.gz \
-    "https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION:-$RATHOLE_FALLBACK_VERSION}/${ASSET}.tar.gz" \
-    || die "Не удалось скачать rathole. Проверьте RATHOLE_VERSION в env.sh (список релизов: https://github.com/rathole-org/rathole/releases)"
-tar -xzf /tmp/rathole.tar.gz -C /tmp
-install -m 755 "/tmp/${ASSET}/rathole" "$RATHOLE_BIN" 2>/dev/null || install -m 755 /tmp/rathole "$RATHOLE_BIN"
-rm -rf /tmp/rathole.tar.gz "/tmp/${ASSET}" /tmp/rathole
+if [ -x "$RATHOLE_BIN" ] && "$RATHOLE_BIN" --version 2>/dev/null | grep -q "$RV"; then
+    log "RatHole $RV уже установлен, пропуск загрузки"
+else
+    log "Установка бинарника rathole ($RV)"
+    # В релизах rathole активы называются <asset>.zip и содержат ОДИН файл
+    # rathole без каталога-обёртки (не .tar.gz!) — см. Assets на странице релиза.
+    ASSET="rathole-x86_64-unknown-linux-gnu" # в v0.5.0 актив БЕЗ версии в имени (проверено HEAD 200)
+    TMPD=$(mktemp -d)
+    trap 'rm -rf "$TMPD"' EXIT
+    curl -fL --retry 3 -o "$TMPD/rathole.zip" \
+        "https://github.com/rathole-org/rathole/releases/download/${RV}/${ASSET}.zip" \
+        || die "Не удалось скачать rathole ($RV). Список релизов: https://github.com/rathole-org/rathole/releases"
+    command -v unzip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq unzip; }
+    unzip -q -o "$TMPD/rathole.zip" -d "$TMPD"
+    RBIN=$(find "$TMPD" -name rathole -type f | head -n1)
+    [ -n "$RBIN" ] || die "Бинарник rathole не найден в архиве"
+    install -m 755 "$RBIN" "$RATHOLE_BIN"
+    rm -rf "$TMPD"; trap - EXIT
+fi
+"$RATHOLE_BIN" --version || die "Скачанный rathole не запускается"
 
 install -d -m 755 /etc/rathole
 cp -f "$SRC_DIR/deploy/rathole/bootstrap-server.toml" /etc/rathole/server.toml
